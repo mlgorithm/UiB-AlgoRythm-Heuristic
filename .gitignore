@@ -1,0 +1,4 @@
+pace2026_heuristic
+*.o
+build/
+__pycache__/
