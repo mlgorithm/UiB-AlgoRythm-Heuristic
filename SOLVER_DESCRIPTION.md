@@ -14,8 +14,12 @@ into agreement-forest components — each component induces the same rooted topo
 in both trees and the components are edge-disjoint in each tree — minimizing the
 number of components `k` (equivalently the rooted SPR distance `k − 1`).
 
-Single C++17 file, anytime, single-threaded, ≤8 GB, SIGTERM-safe. Reads one PACE
-`.nw` instance on stdin, writes one Newick component per line to stdout.
+Single C++17 file, anytime, ≤8 GB, SIGTERM-safe. Reads one PACE `.nw` instance on
+stdin, writes one Newick component per line to stdout. All computation runs on a
+single worker thread (the main thread only blocks on it), so it is single-threaded
+in the PACE sense — the worker just carries a large (1 GiB) stack so that a deeply
+nested (caterpillar/ladder) input cannot overflow the default stack in any recursive
+routine, which would otherwise SIGSEGV with empty output.
 
 ## Algorithm (pipeline)
 

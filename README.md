@@ -11,8 +11,13 @@ See [`SOLVER_DESCRIPTION.md`](SOLVER_DESCRIPTION.md) for the algorithm.
 **External dependencies: none.** A C++17 compiler (GCC ≥ 9 or Clang ≥ 10) is the only requirement.
 
 ```bash
-g++ -O3 -std=c++17 -pipe -o pace2026_heuristic main.cpp
+g++ -O3 -std=c++17 -pipe -pthread -o pace2026_heuristic main.cpp
 ```
+
+The solver runs its work on a worker thread with a large stack (so deeply nested / caterpillar
+inputs cannot overflow the stack), so link the pthread runtime with `-pthread`. On modern glibc
+(≥ 2.34, e.g. the Debian container below) the pthread symbols are already in libc and the flag is a
+no-op, but it keeps the build correct on older toolchains too.
 
 A Debian 13.5 container setup is provided in [`docker_setup.sh`](docker_setup.sh).
 

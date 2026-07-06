@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 #include <unistd.h>
+#include <pthread.h>
 
 using namespace std;
 
@@ -1273,9 +1274,20 @@ struct Solver {
                 if (seen_label[lab]) return false;          // overlap / duplicate
                 seen_label[lab] = 1; ++total;
             }
-            if (c.labels.size() > 1 &&
-                T[0].restricted_newick(c.labels) != T[1].restricted_newick(c.labels))
-                return false;                                // not an agreement subtree
+            if (c.labels.size() > 1) {
+                // Agreement test (component induces the same rooted topology in
+                // both trees). Small components use the independent canonical
+                // Newick string equality; large ones use the O(size log size)
+                // 128-bit topology hash instead, because the string form is
+                // O(size^2) in time AND memory on deep (caterpillar) shapes and
+                // would OOM/time out on a giant near-identical component (e.g.
+                // two identical deep trees -> one size-n component). The hash is
+                // the same canonical agreement test used during construction.
+                bool agree = (c.size <= 4096)
+                    ? (T[0].restricted_newick(c.labels) == T[1].restricted_newick(c.labels))
+                    : (T[0].restricted_topology_hash(c.labels) == T[1].restricted_topology_hash(c.labels));
+                if (!agree) return false;                    // not an agreement subtree
+            }
             for (int ti = 0; ti < 2; ++ti)
                 for (int e : c.edges[ti]) {
                     if (e < 0 || e >= (int)seen_edge[ti].size()) return false;
@@ -4880,8 +4892,21 @@ inline bool kernelize(const string& nw0, const string& nw1, int n,
         return m;
     };
 
+    // Cherry reduction is a single-threaded O(nodes) scan per round, so a long
+    // common "ladder" (deep caterpillar) costs O(n^2) time. Bound it to a small
+    // slice of the budget: a PARTIAL reduction is still optimality-preserving,
+    // and the full solver's O(n) common-clade sweep already collapses giant
+    // common subtrees, so bailing early here loses nothing and hands the rest of
+    // the budget to the actual search instead of burning it in the kernel.
+    const double kern_start_left = deadline::seconds_left();
+    const double kern_cap = std::min(20.0, std::max(1.0, 0.05 * deadline::budget_seconds()));
     bool any = false;
     while (true) {
+        // Stop reducing if the wall-clock budget is gone or the kernel slice is
+        // used up: a valid singleton fallback is already cached, and a PARTIAL
+        // cherry reduction is still optimality-preserving, so breaking here is
+        // always safe.
+        if (deadline::expired() || (kern_start_left - deadline::seconds_left()) > kern_cap) break;
         auto c0 = build_cherries(T0);
         auto c1 = build_cherries(T1);
         vector<pair<long long,int>> common;
@@ -4896,6 +4921,14 @@ inline bool kernelize(const string& nw0, const string& nw1, int n,
             int nl = next_label++;
             if ((int)enw.size() <= nl) enw.resize(nl + 1);
             enw[nl] = "(" + enw[a] + "," + enw[b] + ")";
+            // a and b are subsumed into the new super-leaf nl: they are removed
+            // from both trees and can never be a reachable leaf or a cherry child
+            // again, so their expansion strings are dead. Free them. Without this,
+            // a long common ladder (deep caterpillar) accumulates O(K^2) total
+            // characters across all intermediate super-leaves and blows the 8 GB
+            // memory limit (OOM -> SIGKILL -> empty output -> disqualification).
+            string().swap(enw[a]);
+            string().swap(enw[b]);
             T0.l[u0] = -1; T0.r[u0] = -1; T0.lab[u0] = nl;
             T1.l[u1] = -1; T1.r[u1] = -1; T1.lab[u1] = nl;
             any = true;
@@ -4947,30 +4980,20 @@ inline string expand_component(const string& knw, const vector<string>& expand_n
 
 } // namespace kern
 
-int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+// Process-wide exit status produced by run_solver(); main() returns it after
+// the worker thread joins.
+static std::atomic<int> g_solver_exit_code{0};
 
-    // ---- 5-minute budget with safety margin ---------------------------------
-    // PACE sends SIGTERM at the 5-minute mark. We target 4:58 so cooperative
-    // checks use almost all available time; if the kernel still delivers
-    // SIGTERM, the handler will flush the cached best-so-far via write(2).
-    deadline::init(configured_time_budget_seconds());
-
-    // Install signal handlers BEFORE doing any work so an early SIGTERM is
-    // caught cleanly. SIGINT is also handled so Ctrl-C during local testing
-    // produces the same behavior.
-    {
-        struct sigaction sa;
-        std::memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = pace_signal_handler;
-        // SA_RESTART would resume read()/write() across the signal, but here
-        // we want the handler to immediately _exit, so it doesn't matter.
-        sigemptyset(&sa.sa_mask);
-        ::sigaction(SIGTERM, &sa, nullptr);
-        ::sigaction(SIGINT,  &sa, nullptr);
-    }
-
+// The entire solving pipeline (input parse -> kernelize -> Solver -> flush).
+// Run on a large-stack worker thread (see main) so that a deeply nested
+// (caterpillar / ladder) input cannot overflow the default ~8 MB stack in any
+// recursive routine -- the kernel Newick parser/serializer, restricted_newick,
+// etc. Such an overflow is an UNCATCHABLE SIGSEGV that emits nothing, which
+// under PACE's "one infeasible output disqualifies the whole submission" rule
+// is the worst possible outcome. A 1 GiB stack lets these recursions run to
+// millions of levels deep; only touched pages become resident, so this costs
+// no real memory on the shallow trees that are the common case.
+static void run_solver() {
     int t = -1, n = -1;
     vector<string> trees;
     string line;
@@ -5001,7 +5024,8 @@ int main() {
         if (t != 2) {
             // Heuristic track is two-tree MAF. For non-two-tree input, return the always-feasible singleton partition.
             for (int i = 1; i <= n; ++i) cout << i << ";\n";
-            return 0;
+            g_solver_exit_code.store(0, std::memory_order_relaxed);
+            return;
         }
 
         // Publish the trivial singleton forest BEFORE constructing the Solver,
@@ -5027,7 +5051,13 @@ int main() {
             bool ok = false;
             try { ok = kern::kernelize(trees[0], trees[1], n, r0, r1, em); }
             catch (...) { ok = false; }
-            if (ok && !em.empty() && (int)em.size() < n) {
+            // Adopt the kernel only if it achieved a MEANINGFUL reduction (>=10%).
+            // A barely-reduced kernel (e.g. a time-capped partial reduction of a
+            // deep common ladder) is counterproductive: it costs build time yet
+            // stays nearly as large, delaying the full solver's O(n) common-clade
+            // sweep that collapses the shared structure directly. On such inputs
+            // solving the full instance is both faster and better.
+            if (ok && !em.empty() && (int)em.size() <= (int)(0.90 * (double)n)) {
                 knw0 = std::move(r0); knw1 = std::move(r1);
                 solve_n = (int)em.size(); expand_nwk = std::move(em);
             }
@@ -5060,9 +5090,65 @@ int main() {
         cerr << "solver error: " << e.what() << "\n";
         if (n > 0) {
             for (int i = 1; i <= n; ++i) cout << i << ";\n";
-            return 0;
+            g_solver_exit_code.store(0, std::memory_order_relaxed);
+            return;
         }
-        return 1;
+        g_solver_exit_code.store(1, std::memory_order_relaxed);
+        return;
     }
-    return 0;
+    g_solver_exit_code.store(0, std::memory_order_relaxed);
+}
+
+extern "C" void* solver_thread_entry(void*) {
+    run_solver();
+    return nullptr;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // ---- 5-minute budget with safety margin ---------------------------------
+    // PACE sends SIGTERM at the 5-minute mark. We target 4:58 so cooperative
+    // checks use almost all available time; if the kernel still delivers
+    // SIGTERM, the handler will flush the cached best-so-far via write(2).
+    deadline::init(configured_time_budget_seconds());
+
+    // Install signal handlers BEFORE doing any work so an early SIGTERM is
+    // caught cleanly. SIGINT is also handled so Ctrl-C during local testing
+    // produces the same behavior. Handlers are process-global, so they fire
+    // regardless of which thread the SIGTERM is delivered to; the handler only
+    // reads atomics and calls write(2)/_exit, so running on any thread is safe.
+    {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = pace_signal_handler;
+        // SA_RESTART would resume read()/write() across the signal, but here
+        // we want the handler to immediately _exit, so it doesn't matter.
+        sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGTERM, &sa, nullptr);
+        ::sigaction(SIGINT,  &sa, nullptr);
+    }
+
+    // Run the whole solver on a worker thread with a large (1 GiB) stack so deep
+    // recursive routines cannot overflow the default stack and SIGSEGV with
+    // empty output (see run_solver). pthread_attr_setstacksize sizes the stack
+    // independently of `ulimit -s`, so this is robust even under an 8 MB soft
+    // limit. If thread creation fails for any reason, fall back to running on
+    // the main stack rather than not running at all.
+    bool ran_on_thread = false;
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) == 0) {
+        const size_t big_stack = (size_t)1 << 30;  // 1 GiB
+        if (pthread_attr_setstacksize(&attr, big_stack) == 0) {
+            pthread_t tid;
+            if (pthread_create(&tid, &attr, solver_thread_entry, nullptr) == 0) {
+                pthread_join(tid, nullptr);
+                ran_on_thread = true;
+            }
+        }
+        pthread_attr_destroy(&attr);
+    }
+    if (!ran_on_thread) run_solver();
+    return g_solver_exit_code.load(std::memory_order_relaxed);
 }
